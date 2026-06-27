@@ -1,0 +1,242 @@
+openapi: 3.1.0
+info:
+  title: Doc-Forge API — Document Storage & Page Serving
+  version: 0.1.0
+  description: >
+    Public HTTP contract for uploading construction-plan document sets and serving
+    individual pages in under 2 seconds. Page bytes are served from a CDN via short-lived
+    signed URLs; this API returns metadata and those URLs, never the multi-GB source PDFs
+    on the read path.
+servers:
+  - url: https://api.docforge.example/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: uploads
+  - name: documents
+  - name: pages
+  - name: retention
+
+paths:
+  /uploads:
+    post:
+      tags: [uploads]
+      summary: Begin a resumable upload session for a document set
+      description: Returns an upload session plus pre-signed part URLs (or a tus endpoint) for direct-to-object-store transfer (FR-002).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateUploadRequest' }
+      responses:
+        '201':
+          description: Upload session created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadSession' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /uploads/{uploadId}:
+    get:
+      tags: [uploads]
+      summary: Get upload session status (for resume)
+      parameters: [{ $ref: '#/components/parameters/uploadId' }]
+      responses:
+        '200':
+          description: Current progress, enabling resume from received_bytes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadSession' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /uploads/{uploadId}/finalize:
+    post:
+      tags: [uploads]
+      summary: Finalize an upload; create a DocumentSet and enqueue processing
+      description: Verifies checksum, records the set as `processing`, enqueues async page rendering (FR-003 atomic visibility, FR-006 integrity).
+      parameters: [{ $ref: '#/components/parameters/uploadId' }]
+      responses:
+        '202':
+          description: Accepted; set is processing and will become viewable when ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentSet' }
+        '409':
+          description: Checksum mismatch or already finalized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /document-sets:
+    get:
+      tags: [documents]
+      summary: List document sets accessible to the caller (team-scoped, FR-013)
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/SetStatus' } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        '200':
+          description: Page of document sets the caller's teams own
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/DocumentSet' } }
+                  next_cursor: { type: string, nullable: true }
+
+  /document-sets/{setId}:
+    get:
+      tags: [documents]
+      summary: Get a document set and its documents
+      parameters: [{ $ref: '#/components/parameters/setId' }]
+      responses:
+        '200':
+          description: Document set detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentSetDetail' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /documents/{documentId}/pages/{pageNumber}:
+    get:
+      tags: [pages]
+      summary: Resolve a single page to its viewable artifacts (THE hot path, FR-004/FR-005)
+      description: >
+        Returns metadata and short-lived signed CDN URLs for the page's display image,
+        thumbnail, and DZI tile pyramid. O(1) in document size — never touches the source
+        PDF. Access is authorized by team membership (FR-015) at URL-minting time.
+      parameters:
+        - { $ref: '#/components/parameters/documentId' }
+        - { $ref: '#/components/parameters/pageNumber' }
+      responses:
+        '200':
+          description: Page artifacts available; render in < 2 s via the returned URLs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PageView' }
+        '202':
+          description: Page exists but is still being processed (spec edge case)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProcessingStatus' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /document-sets/{setId}:delete:
+    post:
+      tags: [retention]
+      summary: Attempt deletion (blocked before 7-year retention expiry, FR-007/FR-008)
+      parameters: [{ $ref: '#/components/parameters/setId' }]
+      responses:
+        '204': { description: Deleted (only permitted after retain_until) }
+        '423':
+          description: Locked — within retention window; attempt is audit-logged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  parameters:
+    uploadId: { name: uploadId, in: path, required: true, schema: { type: string, format: uuid } }
+    setId: { name: setId, in: path, required: true, schema: { type: string, format: uuid } }
+    documentId: { name: documentId, in: path, required: true, schema: { type: string, format: uuid } }
+    pageNumber: { name: pageNumber, in: path, required: true, schema: { type: integer, minimum: 1 } }
+
+  responses:
+    Forbidden:
+      description: Caller is not a member of the owning team
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource not found (or not visible to caller)
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    SetStatus:
+      type: string
+      enum: [uploading, processing, ready, failed, quarantined]
+
+    CreateUploadRequest:
+      type: object
+      required: [team_id, title, total_bytes]
+      properties:
+        team_id: { type: string, format: uuid }
+        title: { type: string }
+        total_bytes: { type: integer, format: int64 }
+        sha256: { type: string, description: client-computed checksum for integrity verification }
+
+    UploadSession:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [active, finalized, aborted] }
+        received_bytes: { type: integer, format: int64 }
+        total_bytes: { type: integer, format: int64, nullable: true }
+        part_urls:
+          type: array
+          description: pre-signed object-store URLs for direct, resumable part upload
+          items: { type: string, format: uri }
+        expires_at: { type: string, format: date-time }
+
+    DocumentSet:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
+        title: { type: string }
+        status: { $ref: '#/components/schemas/SetStatus' }
+        document_count: { type: integer }
+        uploaded_at: { type: string, format: date-time }
+        ready_at: { type: string, format: date-time, nullable: true }
+        retain_until: { type: string, format: date }
+
+    DocumentSetDetail:
+      allOf:
+        - $ref: '#/components/schemas/DocumentSet'
+        - type: object
+          properties:
+            documents:
+              type: array
+              items: { $ref: '#/components/schemas/Document' }
+
+    Document:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        filename: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        page_count: { type: integer }
+        order_index: { type: integer }
+
+    PageView:
+      type: object
+      description: Signed CDN URLs + metadata for one page; the read-path response.
+      properties:
+        document_id: { type: string, format: uuid }
+        page_number: { type: integer }
+        width_px: { type: integer }
+        height_px: { type: integer }
+        display_image_url: { type: string, format: uri, description: short-lived signed CDN URL }
+        thumbnail_url: { type: string, format: uri }
+        dzi_url: { type: string, format: uri, description: Deep Zoom descriptor for tiled viewer }
+        url_expires_at: { type: string, format: date-time }
+
+    ProcessingStatus:
+      type: object
+      properties:
+        document_id: { type: string, format: uuid }
+        page_number: { type: integer }
+        status: { type: string, enum: [pending, failed] }
+        message: { type: string }
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }

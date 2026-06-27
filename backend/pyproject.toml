@@ -1,0 +1,50 @@
+[project]
+name = "docforge"
+version = "0.1.0"
+description = "Large construction-plan document storage & sub-2s page serving"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+# Production adapters (deferred in the MVP slice — see specs/001-doc-storage-serving/tasks.md)
+prod = [
+    "uvicorn[standard]>=0.29",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "boto3>=1.34",
+    "celery>=5.3",
+    "redis>=5.0",
+    "PyMuPDF>=1.24",
+    "pyvips>=2.2",
+]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",          # FastAPI TestClient
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docforge"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["docforge"]
+mypy_path = "src"
+strict = true
